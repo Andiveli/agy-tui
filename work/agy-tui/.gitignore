@@ -1,5 +1,9 @@
 # Local Pi runtime state
 .atl/
+.pi-lens/
+
+# Build output directory
+build/
 
 # Compiled binary (root only)
 /agy-tui
