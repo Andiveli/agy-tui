@@ -77,6 +77,7 @@ func (c *Client) StartStreaming(ctx context.Context, prompt string) (io.ReadClos
 		cancel()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	cmd.Stderr = cmd.Stdout // merge stderr into stdout for error visibility
 
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -104,6 +105,7 @@ func (c *Client) ContinueLastStreaming(ctx context.Context, prompt string) (io.R
 		cancel()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	cmd.Stderr = cmd.Stdout // merge stderr into stdout for error visibility
 
 	if err := cmd.Start(); err != nil {
 		cancel()
@@ -160,9 +162,5 @@ func (c *Client) run(ctx context.Context, args []string) (string, error) {
 }
 
 func formatTimeout(d time.Duration) string {
-	secs := int(d.Seconds())
-	if secs < 1 {
-		secs = 1
-	}
-	return fmt.Sprintf("%d", secs)
+	return d.Round(time.Second).String()
 }
