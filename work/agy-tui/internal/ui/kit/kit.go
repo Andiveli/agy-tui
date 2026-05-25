@@ -3,6 +3,8 @@
 package kit
 
 import (
+	"io"
+
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -223,6 +225,12 @@ func ThemeChangedMsgCmd() tea.Cmd {
 type ChatMessage struct {
 	Role    string // "user" or "agent"
 	Content string
+}
+
+// StreamReadyMsg carries the agy pipe reader from the startup goroutine.
+// Update stores the reader on the model to avoid writing model state from inside cmd goroutines.
+type StreamReadyMsg struct {
+	Reader io.ReadCloser
 }
 
 // ChatStreamChunkMsg is sent for each line of a streaming response.

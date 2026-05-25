@@ -80,6 +80,10 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if prompt == "" {
 				return c, nil
 			}
+			// Slash commands
+			if prompt == "/quit" || prompt == "/exit" || prompt == "/q" {
+				return c, tea.Quit
+			}
 			c.input.SetValue("")
 			c.messages = append(c.messages, kit.ChatMessage{Role: "user", Content: prompt})
 			c.loading = true
@@ -115,6 +119,20 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return c, tea.Quit
 		}
 
+	// StreamReadyMsg arrives from startStream goroutine — stores reader/scanner on model.
+	case kit.StreamReadyMsg:
+		c.streamReader = msg.Reader
+		c.streamScanner = bufio.NewScanner(msg.Reader)
+		if c.streamScanner.Scan() {
+			c.streamingText = c.streamScanner.Text() + "\n"
+			c.updateViewport()
+			return c, c.readNextChunk()
+		}
+		// Empty response — clean up immediately
+		c.closeStreamReader()
+		c.loading = false
+		return c, c.emitProgress("completed", 100)
+
 	case kit.ChatStreamChunkMsg:
 		// Append to streaming text and update viewport in real-time
 		c.streamingText += msg.Text + "\n"
@@ -124,6 +142,11 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case kit.ChatCompletedMsg:
 		c.loading = false
 		c.closeStreamReader()
+
+		// Detect conversation ID for SessionManager
+		if convs, err := c.sessionMgr.ListConversations(); err == nil && len(convs) > 0 {
+			c.sessionMgr.SetConversationID(convs[0])
+		}
 
 		// Append a single clean message with the full content
 		content := msg.Content
@@ -179,10 +202,10 @@ func (c *ChatModel) View() string {
 
 // ── Streaming ──────────────────────────────────────────────────────
 
-// startStream checks binary, starts agy, and reads the first line.
+// startStream checks binary, starts agy, and returns the pipe reader.
+// It does NOT write to the model — that happens in the StreamReadyMsg handler (main goroutine).
 func (c *ChatModel) startStream(prompt string) tea.Cmd {
 	return func() tea.Msg {
-		// Check binary exists before trying to start
 		if err := c.client.CheckBinary(); err != nil {
 			return kit.ChatErrorMsg{Err: fmt.Errorf(
 				"agy CLI not found — install Antigravity CLI first: %w", err)}
@@ -201,26 +224,14 @@ func (c *ChatModel) startStream(prompt string) tea.Cmd {
 			return kit.ChatErrorMsg{Err: err}
 		}
 
-		// Store reader and scanner on the model for readNextChunk to use
-		c.streamReader = reader
-		c.streamScanner = bufio.NewScanner(reader)
-
-		// Read the first line
-		if c.streamScanner.Scan() {
-			return kit.ChatStreamChunkMsg{Text: c.streamScanner.Text()}
-		}
-		// Empty response — clean up immediately
-		c.closeStreamReader()
-		return kit.ChatCompletedMsg{
-			Content:     "",
-			SessionName: c.sessionName,
-		}
+		return kit.StreamReadyMsg{Reader: reader}
 	}
 }
 
 // readNextChunk reads the next line from the active stream scanner.
 func (c *ChatModel) readNextChunk() tea.Cmd {
 	return func() tea.Msg {
+		// streamScanner is set in the StreamReadyMsg handler (main goroutine), not in a cmd goroutine.
 		if c.streamScanner == nil {
 			return kit.ChatCompletedMsg{
 				Content:     c.streamingText,
@@ -233,20 +244,12 @@ func (c *ChatModel) readNextChunk() tea.Cmd {
 			return kit.ChatStreamChunkMsg{Text: c.streamScanner.Text()}
 		}
 
-		// Stream ended — capture remaining buffer and clean up
-		content := c.streamingText
-		filePaths := parseFilePaths(content)
-		c.closeStreamReader()
-
-		// Try to detect conversation ID from the directory
-		if convs, err := c.sessionMgr.ListConversations(); err == nil && len(convs) > 0 {
-			c.sessionMgr.SetConversationID(convs[0])
-		}
-
+		// Stream ended — return completion data without touching model state.
+		// Cleanup happens in the ChatCompletedMsg handler (main goroutine).
 		return kit.ChatCompletedMsg{
-			Content:     content,
+			Content:     c.streamingText,
 			SessionName: c.sessionName,
-			FilePaths:   filePaths,
+			FilePaths:   parseFilePaths(c.streamingText),
 		}
 	}
 }
