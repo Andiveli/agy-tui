@@ -1,0 +1,10 @@
+{
+  "agy-tui": {
+    "PreInvocation": [
+      {
+        "command": "echo '{\"injectSteps\":[{\"ephemeralMessage\":\"The agy-tui plugin provides a Terminal User Interface (TUI) for agy. Available: `agy-tui` command to launch. The TUI supports: streaming chat with agy sidebar with session/MCP/LSP/progress/file panels session auto-naming from first prompt Ctrl+B toggle sidebar Ctrl+T theme editor Ctrl+C during streaming to cancel Enter to send prompt. Status bar shows session name, key hints, and connection indicators (agy/mcp/lsp).\"}]}'",
+        "type": "command"
+      }
+    ]
+  }
+}

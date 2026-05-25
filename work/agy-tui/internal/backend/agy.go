@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -57,48 +56,31 @@ func (c *Client) ContinueLast(ctx context.Context, prompt string) (string, error
 	return c.run(ctx, args)
 }
 
-// StreamChunk contains a single line of streaming output and a way to read the next one.
-type StreamChunk struct {
-	Text    string
-	Scanner *bufio.Scanner
-	Reader  io.ReadCloser
-}
-
 // StartStreaming runs agy and returns a ReadCloser for reading output incrementally.
 func (c *Client) StartStreaming(ctx context.Context, prompt string) (io.ReadCloser, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.Timeout)
-	cmd := exec.CommandContext(ctx, c.BinaryPath,
-		"--print", prompt,
-		"--print-timeout", formatTimeout(c.Timeout),
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	cmd.Stderr = cmd.Stdout // merge stderr into stdout for error visibility
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("agy start: %w", err)
-	}
-
-	return &cmdReadCloser{
-		ReadCloser: stdout,
-		cancel:     cancel,
-		cmd:        cmd,
-	}, nil
+	return c.startStreaming(ctx, prompt)
 }
 
 // ContinueLastStreaming runs agy with --continue to continue the last conversation.
 func (c *Client) ContinueLastStreaming(ctx context.Context, prompt string) (io.ReadCloser, error) {
+	return c.startStreaming(ctx, prompt, "--continue")
+}
+
+// ContinueConversationStreaming runs agy with --conversation <id>.
+func (c *Client) ContinueConversationStreaming(ctx context.Context, conversationID, prompt string) (io.ReadCloser, error) {
+	return c.startStreaming(ctx, prompt, "--conversation", conversationID)
+}
+
+// startStreaming is the shared implementation for streaming agy invocations.
+func (c *Client) startStreaming(ctx context.Context, prompt string, extraArgs ...string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.Timeout)
-	cmd := exec.CommandContext(ctx, c.BinaryPath,
+	args := []string{
 		"--print", prompt,
 		"--print-timeout", formatTimeout(c.Timeout),
-		"--continue",
-	)
+	}
+	args = append(args, extraArgs...)
+
+	cmd := exec.CommandContext(ctx, c.BinaryPath, args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -159,6 +141,15 @@ func (c *Client) run(ctx context.Context, args []string) (string, error) {
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// CheckBinary verifies that the agy binary is available in PATH.
+func (c *Client) CheckBinary() error {
+	_, err := exec.LookPath(c.BinaryPath)
+	if err != nil {
+		return fmt.Errorf("%s not found in $PATH: %w", c.BinaryPath, err)
+	}
+	return nil
 }
 
 func formatTimeout(d time.Duration) string {

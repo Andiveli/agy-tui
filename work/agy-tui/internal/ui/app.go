@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -13,12 +14,16 @@ import (
 	"github.com/samael/agy-tui/internal/ui/kit"
 )
 
+// pollInterval is how often MCP/LSP status is refreshed.
+const pollInterval = 15 * time.Second
+
 // App is the root Bubbletea model.
 type App struct {
 	theme       kit.Theme
 	styles      kit.Styles
 	sidebar     *Sidebar
 	chat        *ChatModel
+	statusBar   *StatusBar
 	themeEditor *kit.ThemeEditor
 	showSidebar bool
 	width       int
@@ -33,6 +38,7 @@ func NewApp() *App {
 		styles:      s,
 		sidebar:     NewSidebar(s),
 		chat:        NewChatModel(s, backend.NewClient()),
+		statusBar:   NewStatusBar(s),
 		showSidebar: true,
 		width:       80,
 		height:      24,
@@ -46,8 +52,19 @@ func (a *App) Init() tea.Cmd {
 		a.probeMCP(),
 		a.probeLSP(),
 		a.probeWorkspace(),
+		a.pollTick(),
 	)
 }
+
+// pollTick returns a command that triggers periodic MCP/LSP re-probing.
+func (a *App) pollTick() tea.Cmd {
+	return tea.Tick(pollInterval, func(t time.Time) tea.Msg {
+		return pollTickMsg{}
+	})
+}
+
+// pollTickMsg is sent when it's time to re-probe MCP and LSP.
+type pollTickMsg struct{}
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// If theme editor is open, route to it first
@@ -76,19 +93,28 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.styles = kit.DeriveStyles(a.theme)
 		return a, nil
 
-	// ── Domain messages routed to sidebar ──
+	// ── Tick ──
+
+	case pollTickMsg:
+		return a, tea.Batch(a.probeMCP(), a.probeLSP(), a.pollTick())
+
+	// ── Domain messages routed to sidebar + status bar ──
 
 	case kit.MCPStatusMsg:
 		a.sidebar, _ = a.sidebar.Update(msg)
+		a.statusBar.Update(msg)
 		return a, nil
 	case kit.LSPStatusMsg:
 		a.sidebar, _ = a.sidebar.Update(msg)
+		a.statusBar.Update(msg)
 		return a, nil
 	case kit.SessionChangedMsg:
 		a.sidebar, _ = a.sidebar.Update(msg)
+		a.statusBar.Update(msg)
 		return a, nil
 	case kit.ProgressMsg:
 		a.sidebar, _ = a.sidebar.Update(msg)
+		a.statusBar.Update(msg)
 		return a, nil
 	case kit.FileChangedMsg:
 		a.sidebar, _ = a.sidebar.Update(msg)
@@ -107,46 +133,43 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) View() string {
-	mainContent := a.chat.View()
-	if !a.showSidebar {
-		return a.renderWithOverlay(mainContent)
+	// Full-screen modal when theme editor is open
+	if a.themeEditor != nil && a.themeEditor.Open {
+		return RenderThemeEditorOverlay(a.themeEditor, a.width, a.height)
 	}
-	sidebarContent := a.sidebar.View()
-	if sidebarContent == "" {
-		return a.renderWithOverlay(mainContent)
-	}
-	return a.renderWithOverlay(
-		lipgloss.JoinHorizontal(lipgloss.Top, mainContent, sidebarContent),
-	)
-}
 
-// renderWithOverlay overlays the theme editor if open.
-func (a *App) renderWithOverlay(base string) string {
-	if a.themeEditor == nil || !a.themeEditor.Open {
-		return base
+	mainContent := a.chat.View()
+	if a.showSidebar {
+		sidebarContent := a.sidebar.View()
+		if sidebarContent != "" {
+			mainContent = lipgloss.JoinHorizontal(lipgloss.Top, mainContent, sidebarContent)
+		}
 	}
-	overlay := RenderThemeEditorOverlay(a.themeEditor, a.width, a.height)
-	if overlay == "" {
-		return base
-	}
-	// Place the overlay on top of everything
-	return lipgloss.JoinVertical(lipgloss.Top, base, overlay)
+
+	bar := a.statusBar.View(a.width)
+	return lipgloss.JoinVertical(lipgloss.Top, mainContent, bar)
 }
 
 func (a *App) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
+	// Reserve 1 line for the status bar
+	contentHeight := msg.Height - 1
+	if contentHeight < 5 {
+		contentHeight = 5
+	}
+
 	sidebarWidth := 0
 	if a.showSidebar && msg.Width >= 100 {
 		sidebarWidth = 30
 	}
 	a.sidebar.width = sidebarWidth
-	a.sidebar.height = msg.Height
+	a.sidebar.height = contentHeight
 
 	mainWidth := msg.Width - sidebarWidth
 	if mainWidth < 10 {
 		mainWidth = 10
 	}
 	_, cmd := a.chat.Update(tea.WindowSizeMsg{
-		Width: mainWidth, Height: msg.Height,
+		Width: mainWidth, Height: contentHeight,
 	})
 	return cmd
 }

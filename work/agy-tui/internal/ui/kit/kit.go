@@ -33,22 +33,22 @@ type Theme struct {
 // DefaultCatppuccinMocha returns the default theme.
 func DefaultCatppuccinMocha() Theme {
 	return Theme{
-	Base:     lipgloss.Color("#1e1e2e"),
-	Surface0: lipgloss.Color("#313244"),
-	Surface1: lipgloss.Color("#45475a"),
-	Surface2: lipgloss.Color("#585b70"),
-	Overlay:  lipgloss.Color("#6c7086"),
-	Text:     lipgloss.Color("#cdd6f4"),
-	Subtext:  lipgloss.Color("#a6adc8"),
-	Lavender: lipgloss.Color("#b4befe"),
-	Blue:     lipgloss.Color("#89b4fa"),
-	Sapphire: lipgloss.Color("#74c7ec"),
-	Green:    lipgloss.Color("#a6e3a1"),
-	Yellow:   lipgloss.Color("#f9e2af"),
-	Peach:    lipgloss.Color("#fab387"),
-	Red:      lipgloss.Color("#f38ba8"),
-	Mauve:    lipgloss.Color("#cba6f7"),
-	Pink:     lipgloss.Color("#f5c2e7"),
+		Base:     lipgloss.Color("#1e1e2e"),
+		Surface0: lipgloss.Color("#313244"),
+		Surface1: lipgloss.Color("#45475a"),
+		Surface2: lipgloss.Color("#585b70"),
+		Overlay:  lipgloss.Color("#6c7086"),
+		Text:     lipgloss.Color("#cdd6f4"),
+		Subtext:  lipgloss.Color("#a6adc8"),
+		Lavender: lipgloss.Color("#b4befe"),
+		Blue:     lipgloss.Color("#89b4fa"),
+		Sapphire: lipgloss.Color("#74c7ec"),
+		Green:    lipgloss.Color("#a6e3a1"),
+		Yellow:   lipgloss.Color("#f9e2af"),
+		Peach:    lipgloss.Color("#fab387"),
+		Red:      lipgloss.Color("#f38ba8"),
+		Mauve:    lipgloss.Color("#cba6f7"),
+		Pink:     lipgloss.Color("#f5c2e7"),
 	}
 }
 
@@ -202,8 +202,10 @@ type FileChangedMsg struct {
 }
 
 type SessionChangedMsg struct {
-	Name    string
-	Context string
+	Name      string
+	Context   string
+	ConvCount int    // number of saved agy conversations
+	ConvID    string // current conversation ID (if resumed)
 }
 
 type ThemeChangedMsg struct{}

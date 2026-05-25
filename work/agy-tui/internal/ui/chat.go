@@ -19,17 +19,20 @@ import (
 
 // ChatModel with streaming support.
 type ChatModel struct {
-	viewport    viewport.Model
-	input       textinput.Model
-	messages    []kit.ChatMessage
-	loading     bool
-	styles      kit.Styles
-	client      *backend.Client
-	sessionName string
-	promptCount int
-	streamBuf   strings.Builder
-	width       int
-	height      int
+	viewport      viewport.Model
+	input         textinput.Model
+	messages      []kit.ChatMessage
+	loading       bool
+	styles        kit.Styles
+	client        *backend.Client
+	sessionMgr    *backend.SessionManager
+	sessionName   string
+	promptCount   int
+	streamingText string         // text accumulated during active streaming (shown in real-time)
+	streamReader  io.ReadCloser  // active stream pipe (set while loading, nil otherwise)
+	streamScanner *bufio.Scanner // persistent scanner across chunks (avoids losing buffered data)
+	width         int
+	height        int
 }
 
 var filePathPattern = regexp.MustCompile(`([a-zA-Z0-9_/.-]+\.(go|ts|tsx|js|jsx|py|rs|css|md|json|yaml|yml|mod|sum))`)
@@ -44,12 +47,13 @@ func NewChatModel(styles kit.Styles, client *backend.Client) *ChatModel {
 	ti.Width = 60
 	ti.Focus()
 	return &ChatModel{
-		viewport: vp,
-		input:    ti,
-		styles:   styles,
-		client:   client,
-		width:    80,
-		height:   24,
+		viewport:   vp,
+		input:      ti,
+		styles:     styles,
+		client:     client,
+		sessionMgr: backend.NewSessionManager(),
+		width:      80,
+		height:     24,
 	}
 }
 
@@ -80,7 +84,7 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.messages = append(c.messages, kit.ChatMessage{Role: "user", Content: prompt})
 			c.loading = true
 			c.promptCount++
-			c.streamBuf.Reset()
+			c.streamingText = ""
 			c.updateViewport()
 
 			cmds := []tea.Cmd{c.emitProgress("running", 0), c.startStream(prompt)}
@@ -88,12 +92,22 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// On first prompt, derive session name
 			if c.promptCount == 1 {
 				c.sessionName = slugify(prompt)
+				c.sessionMgr.StartSession()
 				cmds = append(cmds, c.emitSession(c.sessionName, ""))
 			}
 
 			return c, tea.Batch(cmds...)
 
 		case "ctrl+c":
+			// If streaming, cancel the current request
+			if c.loading {
+				c.loading = false
+				c.closeStreamReader()
+				c.streamingText = ""
+				c.messages = append(c.messages, kit.ChatMessage{Role: "agent", Content: "⚠️ Cancelled"})
+				c.updateViewport()
+				return c, tea.Batch(c.emitProgress("failed", 0), c.emitDisconnected())
+			}
 			if c.input.Value() != "" {
 				c.input.SetValue("")
 				return c, nil
@@ -101,19 +115,23 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return c, tea.Quit
 		}
 
-	case *backend.StreamChunk:
-		// Append line to buffer and show in viewport
-		c.streamBuf.WriteString(msg.Text + "\n")
-		c.messages = append(c.messages, kit.ChatMessage{Role: "agent", Content: msg.Text + "\n"})
+	case kit.ChatStreamChunkMsg:
+		// Append to streaming text and update viewport in real-time
+		c.streamingText += msg.Text + "\n"
 		c.updateViewport()
-		// Schedule reading the next chunk
-		return c, c.readNextChunk(msg.Scanner, msg.Reader)
+		return c, c.readNextChunk()
 
 	case kit.ChatCompletedMsg:
 		c.loading = false
-		// Replace the individual stream chunks with the final content
-		c.removeLastAgentMessages()
-		c.messages = append(c.messages, kit.ChatMessage{Role: "agent", Content: msg.Content})
+		c.closeStreamReader()
+
+		// Append a single clean message with the full content
+		content := msg.Content
+		if content == "" && c.streamingText != "" {
+			content = c.streamingText
+		}
+		c.messages = append(c.messages, kit.ChatMessage{Role: "agent", Content: content})
+		c.streamingText = ""
 		c.updateViewport()
 
 		return c, tea.Batch(
@@ -124,10 +142,13 @@ func (c *ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case kit.ChatErrorMsg:
 		c.loading = false
-		errMsg := fmt.Sprintf("Error: %s", msg.Err.Error())
+		c.closeStreamReader()
+		c.streamingText = ""
+
+		errMsg := fmt.Sprintf("⚠️ Error: %s", msg.Err.Error())
 		c.messages = append(c.messages, kit.ChatMessage{Role: "agent", Content: errMsg})
 		c.updateViewport()
-		return c, c.emitProgress("failed", 0)
+		return c, tea.Batch(c.emitProgress("failed", 0), c.emitDisconnected())
 	}
 
 	var cmd tea.Cmd
@@ -140,7 +161,11 @@ func (c *ChatModel) View() string {
 	content := c.viewport.View()
 	var inputLine string
 	if c.loading {
-		inputLine = c.styles.Dimmed.Render(" Waiting for response...")
+		if c.streamingText != "" {
+			inputLine = c.styles.InputPrompt.Render(" Streaming... (Ctrl+C to cancel)")
+		} else {
+			inputLine = c.styles.Dimmed.Render(" Sending...")
+		}
 	} else {
 		inputLine = c.input.View()
 	}
@@ -152,9 +177,17 @@ func (c *ChatModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Top, header, content, inputBox)
 }
 
-// startStream launches agy and reads the first chunk.
+// ── Streaming ──────────────────────────────────────────────────────
+
+// startStream checks binary, starts agy, and reads the first line.
 func (c *ChatModel) startStream(prompt string) tea.Cmd {
 	return func() tea.Msg {
+		// Check binary exists before trying to start
+		if err := c.client.CheckBinary(); err != nil {
+			return kit.ChatErrorMsg{Err: fmt.Errorf(
+				"agy CLI not found — install Antigravity CLI first: %w", err)}
+		}
+
 		ctx := context.Background()
 
 		var reader io.ReadCloser
@@ -167,16 +200,17 @@ func (c *ChatModel) startStream(prompt string) tea.Cmd {
 		if err != nil {
 			return kit.ChatErrorMsg{Err: err}
 		}
-		scanner := bufio.NewScanner(reader)
-		if scanner.Scan() {
-			return &backend.StreamChunk{
-				Text:    scanner.Text(),
-				Scanner: scanner,
-				Reader:  reader,
-			}
+
+		// Store reader and scanner on the model for readNextChunk to use
+		c.streamReader = reader
+		c.streamScanner = bufio.NewScanner(reader)
+
+		// Read the first line
+		if c.streamScanner.Scan() {
+			return kit.ChatStreamChunkMsg{Text: c.streamScanner.Text()}
 		}
-		// Empty response
-		reader.Close()
+		// Empty response — clean up immediately
+		c.closeStreamReader()
 		return kit.ChatCompletedMsg{
 			Content:     "",
 			SessionName: c.sessionName,
@@ -184,25 +218,49 @@ func (c *ChatModel) startStream(prompt string) tea.Cmd {
 	}
 }
 
-// readNextChunk reads the next line from the scanner and returns a message.
-func (c *ChatModel) readNextChunk(scanner *bufio.Scanner, reader io.ReadCloser) tea.Cmd {
+// readNextChunk reads the next line from the active stream scanner.
+func (c *ChatModel) readNextChunk() tea.Cmd {
 	return func() tea.Msg {
-		if scanner.Scan() {
-			return &backend.StreamChunk{
-				Text:    scanner.Text(),
-				Scanner: scanner,
-				Reader:  reader,
+		if c.streamScanner == nil {
+			return kit.ChatCompletedMsg{
+				Content:     c.streamingText,
+				SessionName: c.sessionName,
+				FilePaths:   parseFilePaths(c.streamingText),
 			}
 		}
-		reader.Close()
-		content := c.streamBuf.String()
+
+		if c.streamScanner.Scan() {
+			return kit.ChatStreamChunkMsg{Text: c.streamScanner.Text()}
+		}
+
+		// Stream ended — capture remaining buffer and clean up
+		content := c.streamingText
+		filePaths := parseFilePaths(content)
+		c.closeStreamReader()
+
+		// Try to detect conversation ID from the directory
+		if convs, err := c.sessionMgr.ListConversations(); err == nil && len(convs) > 0 {
+			c.sessionMgr.SetConversationID(convs[0])
+		}
+
 		return kit.ChatCompletedMsg{
 			Content:     content,
 			SessionName: c.sessionName,
-			FilePaths:   parseFilePaths(content),
+			FilePaths:   filePaths,
 		}
 	}
 }
+
+// closeStreamReader closes the active stream pipe and clears scanner state.
+func (c *ChatModel) closeStreamReader() {
+	if c.streamReader != nil {
+		c.streamReader.Close()
+		c.streamReader = nil
+	}
+	c.streamScanner = nil
+}
+
+// ── Sidebar messages ──────────────────────────────────────────────
 
 func (c *ChatModel) emitProgress(status string, progress int) tea.Cmd {
 	return func() tea.Msg {
@@ -212,13 +270,21 @@ func (c *ChatModel) emitProgress(status string, progress int) tea.Cmd {
 
 func (c *ChatModel) emitSession(name, context string) tea.Cmd {
 	return func() tea.Msg {
-		return kit.SessionChangedMsg{Name: name, Context: context}
+		msg := kit.SessionChangedMsg{Name: name, Context: context}
+		if c.sessionMgr != nil {
+			if convs, err := c.sessionMgr.ListConversations(); err == nil {
+				msg.ConvCount = len(convs)
+			}
+			if cur := c.sessionMgr.CurrentSession(); cur != nil {
+				msg.ConvID = cur.ID
+			}
+		}
+		return msg
 	}
 }
 
 func (c *ChatModel) emitFileChanges(paths []string) tea.Cmd {
 	return func() tea.Msg {
-		// Only send the first file to avoid flooding
 		if len(paths) > 0 {
 			return kit.FileChangedMsg{Path: paths[0], Action: "modified"}
 		}
@@ -226,19 +292,18 @@ func (c *ChatModel) emitFileChanges(paths []string) tea.Cmd {
 	}
 }
 
-func (c *ChatModel) removeLastAgentMessages() {
-	// Remove streaming chunk messages from the end
-	for i := len(c.messages) - 1; i >= 0; i-- {
-		if c.messages[i].Role == "user" {
-			break
-		}
-		c.messages = c.messages[:i]
+func (c *ChatModel) emitDisconnected() tea.Cmd {
+	return func() tea.Msg {
+		return kit.MCPStatusMsg{Connected: false, Status: "agy unreachable"}
 	}
 }
+
+// ── Viewport rendering ────────────────────────────────────────────
 
 func (c *ChatModel) updateViewport() {
 	var rendered []string
 	var agentBuf strings.Builder
+
 	for _, m := range c.messages {
 		switch m.Role {
 		case "user":
@@ -254,22 +319,25 @@ func (c *ChatModel) updateViewport() {
 	if agentBuf.Len() > 0 {
 		rendered = append(rendered, c.styles.AgentMessage.Render(agentBuf.String()))
 	}
-	if c.loading && c.streamBuf.Len() == 0 {
-		rendered = append(rendered, c.styles.Dimmed.Render(" Sending..."))
+
+	// Show streaming text in real-time without adding it to messages
+	if c.loading && c.streamingText != "" {
+		rendered = append(rendered, c.styles.AgentMessage.Render(c.streamingText))
 	}
+
 	content := lipgloss.JoinVertical(lipgloss.Top, rendered...)
 	c.viewport.SetContent(content)
 	c.viewport.GotoBottom()
 }
 
+// ── Helpers ───────────────────────────────────────────────────────
+
 // slugify derives a session name from the first ~4 words of a prompt.
 func slugify(prompt string) string {
-	// Split into words, take first 4
 	words := strings.Fields(prompt)
 	if len(words) > 4 {
 		words = words[:4]
 	}
-	// Lowercase and join with hyphens
 	var clean []string
 	for _, w := range words {
 		w = strings.ToLower(w)
