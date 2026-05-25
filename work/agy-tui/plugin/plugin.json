@@ -1,0 +1,5 @@
+{
+  "name": "agy-tui",
+  "description": "Terminal User Interface for Antigravity CLI — rich TUI with chat, context panels, and session management.",
+  "version": "0.1.0"
+}
